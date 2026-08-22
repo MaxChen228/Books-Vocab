@@ -45,6 +45,9 @@ def _required_checks_query(numbers: tuple[int, ...]) -> str:
             commit {{
               statusCheckRollup {{
                 contexts(first: 100) {{
+                  pageInfo {{
+                    hasNextPage
+                  }}
                   nodes {{
                     __typename
                     ... on CheckRun {{
@@ -101,7 +104,18 @@ def _snapshot_from_node(node: object, *, number: int) -> CheckSnapshot:
     commit = commit_nodes[0].get("commit") if commit_nodes else None
     rollup = commit.get("statusCheckRollup") if isinstance(commit, Mapping) else None
     contexts = rollup.get("contexts") if isinstance(rollup, Mapping) else None
-    context_nodes = contexts.get("nodes") if isinstance(contexts, Mapping) else []
+    if not isinstance(contexts, Mapping):
+        raise AdapterPayloadError(f"required PR {number} check connection is malformed")
+    page_info = contexts.get("pageInfo")
+    if not isinstance(page_info, Mapping) or type(page_info.get("hasNextPage")) is not bool:
+        raise AdapterPayloadError(
+            f"required PR {number} check connection pageInfo is malformed"
+        )
+    if page_info["hasNextPage"]:
+        raise AdapterPayloadError(
+            f"required PR {number} check connection hasNextPage=true"
+        )
+    context_nodes = contexts.get("nodes")
     if not isinstance(context_nodes, list):
         raise AdapterPayloadError(f"required PR {number} check connection is malformed")
 

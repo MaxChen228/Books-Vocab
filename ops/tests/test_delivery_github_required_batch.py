@@ -18,6 +18,7 @@ from delivery_control.ports.process import CommandResult
 
 HEAD = "a" * 40
 BASE = "b" * 40
+_DEFAULT_PAGE_INFO = object()
 
 
 class StaticRunner:
@@ -53,7 +54,10 @@ def _context_payload(
     head: str = HEAD,
     conclusion: str = "SUCCESS",
     required: bool = True,
+    page_info: object = _DEFAULT_PAGE_INFO,
 ) -> dict[str, object]:
+    if page_info is _DEFAULT_PAGE_INFO:
+        page_info = {"hasNextPage": False}
     return {
         "data": {
             "repository": {
@@ -66,6 +70,7 @@ def _context_payload(
                                 "commit": {
                                     "statusCheckRollup": {
                                         "contexts": {
+                                            "pageInfo": page_info,
                                             "nodes": [
                                                 {
                                                     "__typename": "CheckRun",
@@ -131,6 +136,39 @@ def test_batch_required_snapshot_filters_advisory_and_consumes_once() -> None:
     assert len(runner.calls) == 2
     query = next(part for part in runner.calls[1] if part.startswith("query="))
     assert "pullRequest(number: 12)" in query
+
+
+@pytest.mark.parametrize(
+    ("page_info", "message"),
+    [
+        ({"hasNextPage": True}, "hasNextPage=true"),
+        ({}, "pageInfo is malformed"),
+        (None, "pageInfo is malformed"),
+    ],
+)
+def test_batch_rejects_incomplete_required_context_connection(
+    page_info: object, message: str
+) -> None:
+    runner = StaticRunner(
+        [
+            CommandResult(
+                ("gh", "repo", "view"),
+                0,
+                json.dumps({"nameWithOwner": "owner/repo"}),
+                "",
+            ),
+            CommandResult(
+                ("gh", "api", "graphql"),
+                0,
+                json.dumps(_context_payload(number=12, page_info=page_info)),
+                "",
+            ),
+        ]
+    )
+    checks = _checks(runner)
+
+    with pytest.raises(AdapterPayloadError, match=message):
+        checks.prime_required_snapshots((12,))
 
 
 def test_batch_head_drift_falls_back_to_exact_live_check() -> None:
