@@ -64,6 +64,47 @@ def _expected_heads(
     return frozenset(values)
 
 
+def _unique_heads(values: tuple[str | None, ...]) -> frozenset[str]:
+    return frozenset(value for value in values if value is not None)
+
+
+def _live_evidence_conflicts(
+    records: tuple[RegistrySnapshot, ...],
+    pull_requests: tuple[PullRequestSnapshot, ...],
+) -> bool:
+    """Reject contradictory evidence before classifying a live lane.
+
+    A branch ref may be equal to one of several observed heads while the
+    claims themselves disagree.  Membership in the union is therefore not
+    enough: it could hide a registry/PR split and incorrectly preserve or
+    clean the wrong asset.
+    """
+
+    live_records = tuple(item for item in records if item.status in _ACTIVE_STATUSES)
+    open_prs = tuple(item for item in pull_requests if item.state == "OPEN")
+    record_heads = _unique_heads(tuple(item.handed_back_sha for item in live_records))
+    pr_heads = _unique_heads(tuple(item.head_sha for item in open_prs))
+    if len(record_heads) > 1 or len(pr_heads) > 1:
+        return True
+    return bool(record_heads and pr_heads and record_heads != pr_heads)
+
+
+def _exact_merged_evidence(
+    records: tuple[RegistrySnapshot, ...],
+    pull_requests: tuple[PullRequestSnapshot, ...],
+) -> bool:
+    """Require one complete merged proof before exposing cleanup-ready."""
+
+    merged_records = tuple(item for item in records if item.status == "merged")
+    merged_prs = tuple(item for item in pull_requests if item.state == "MERGED")
+    if len(records) != 1 or len(pull_requests) != 1:
+        return False
+    if len(merged_records) != 1 or len(merged_prs) != 1:
+        return False
+    record_head = merged_records[0].handed_back_sha
+    return record_head is not None and record_head == merged_prs[0].head_sha
+
+
 def _asset(
     *,
     branch: str,
@@ -132,6 +173,19 @@ def _project_asset(
             physical=physical,
             snapshots=snapshots,
         )
+    if _live_evidence_conflicts(records, pull_requests):
+        return _asset(
+            branch=branch,
+            side=side,
+            sha=sha,
+            disposition=BranchDisposition.UNKNOWN,
+            action=BranchCleanupAction.INSPECT_UNKNOWN,
+            reason="live registry and PR evidence disagree on branch HEAD",
+            records=records,
+            pull_requests=pull_requests,
+            physical=physical,
+            snapshots=snapshots,
+        )
     if expected_heads and sha not in expected_heads:
         return _asset(
             branch=branch,
@@ -159,6 +213,19 @@ def _project_asset(
             snapshots=snapshots,
         )
     open_prs = tuple(item for item in pull_requests if item.state == "OPEN")
+    if len(open_prs) > 1:
+        return _asset(
+            branch=branch,
+            side=side,
+            sha=sha,
+            disposition=BranchDisposition.UNKNOWN,
+            action=BranchCleanupAction.INSPECT_UNKNOWN,
+            reason="multiple open PRs share one branch",
+            records=records,
+            pull_requests=pull_requests,
+            physical=physical,
+            snapshots=snapshots,
+        )
     if open_prs:
         return _asset(
             branch=branch,
@@ -175,7 +242,24 @@ def _project_asset(
     merged_prs = tuple(item for item in pull_requests if item.state == "MERGED")
     merged_records = tuple(item for item in records if item.status == "merged")
     dirty = bool(_dirty_paths(physical, snapshots))
-    if merged_prs and merged_records and not dirty:
+    if (
+        merged_prs
+        and merged_records
+        and not _exact_merged_evidence(records, pull_requests)
+    ):
+        return _asset(
+            branch=branch,
+            side=side,
+            sha=sha,
+            disposition=BranchDisposition.UNKNOWN,
+            action=BranchCleanupAction.INSPECT_UNKNOWN,
+            reason="merged registry and PR evidence is not one exact terminal proof",
+            records=records,
+            pull_requests=pull_requests,
+            physical=physical,
+            snapshots=snapshots,
+        )
+    if _exact_merged_evidence(records, pull_requests) and not dirty:
         return _asset(
             branch=branch,
             side=side,
