@@ -137,6 +137,44 @@ def test_merged_branch_requires_exact_terminal_proof_before_cleanup() -> None:
     assert closed.disposition is BranchDisposition.CLOSED_DISPOSITION_REQUIRED
 
 
+def test_mismatched_merged_heads_are_unknown_not_cleanup_ready() -> None:
+    asset = project_branch_lifecycle(
+        branch_inventory=BranchInventory(remote=(("feat/mismatch", SHA_B),)),
+        records=(_record("feat/mismatch", status="merged", handed_back_sha=SHA_C),),
+        pull_requests=(_pr(14, "feat/mismatch", state="MERGED", head_sha=SHA_B),),
+    ).remote[0]
+
+    assert asset.disposition is BranchDisposition.UNKNOWN
+    assert asset.cleanup_action is BranchCleanupAction.INSPECT_UNKNOWN
+    assert not asset.cleanup_ready
+
+
+def test_active_registry_and_open_pr_must_share_one_head() -> None:
+    asset = project_branch_lifecycle(
+        branch_inventory=BranchInventory(local=(("feat/live-mismatch", SHA_B),)),
+        records=(
+            _record("feat/live-mismatch", status="active", handed_back_sha=SHA_B),
+        ),
+        pull_requests=(_pr(15, "feat/live-mismatch", state="OPEN", head_sha=SHA_C),),
+    ).local[0]
+
+    assert asset.disposition is BranchDisposition.UNKNOWN
+    assert asset.cleanup_action is BranchCleanupAction.INSPECT_UNKNOWN
+
+
+def test_multiple_open_prs_are_not_a_durable_single_branch_lane() -> None:
+    asset = project_branch_lifecycle(
+        branch_inventory=BranchInventory(remote=(("feat/multiple-open", SHA_B),)),
+        pull_requests=(
+            _pr(16, "feat/multiple-open", state="OPEN", head_sha=SHA_B),
+            _pr(17, "feat/multiple-open", state="OPEN", head_sha=SHA_B),
+        ),
+    ).remote[0]
+
+    assert asset.disposition is BranchDisposition.UNKNOWN
+    assert asset.cleanup_action is BranchCleanupAction.INSPECT_UNKNOWN
+
+
 def test_dirty_physical_asset_is_retained_even_after_merge_evidence() -> None:
     path = Path("/tmp/dirty-worktree")
     asset = project_branch_lifecycle(
