@@ -10,7 +10,24 @@ from ..domain.models import CheckStatus
 from ..domain.observations import CheckSnapshot, PullRequestSnapshot
 from .errors import AdapterPayloadError
 from .github_client import GitHubCliClient
+from .github_required_batch import batch_required_snapshots
 from .timestamps import parse_optional_timestamp
+
+
+def _status_from_states(states: set[str]) -> CheckStatus:
+    if not states:
+        return CheckStatus.ABSENT
+    if states & {
+        "FAILURE",
+        "ERROR",
+        "CANCELLED",
+        "TIMED_OUT",
+        "ACTION_REQUIRED",
+    }:
+        return CheckStatus.FAILURE
+    if states <= {"SUCCESS", "SKIPPED", "NEUTRAL"}:
+        return CheckStatus.SUCCESS
+    return CheckStatus.PENDING
 
 
 class GitHubChecks:
@@ -22,9 +39,16 @@ class GitHubChecks:
     ) -> None:
         self.client = client
         self.get_pull_request = get_pull_request
+        self._batched_required: dict[int, CheckSnapshot] = {}
 
-    def required_snapshot(self, number: int) -> CheckSnapshot:
-        before = self.get_pull_request(number)
+    def prime_required_snapshots(self, numbers: tuple[int, ...]) -> None:
+        """Prime an observation-only cache using bounded GraphQL batches."""
+
+        self._batched_required = batch_required_snapshots(self.client, numbers)
+
+    def _required_snapshot_live(
+        self, number: int, *, before: PullRequestSnapshot
+    ) -> CheckSnapshot:
         payload = self.client.load_json(
             (
                 "gh",
@@ -52,7 +76,12 @@ class GitHubChecks:
                 raise AdapterPayloadError(f"required check[{index}] is malformed")
             names.append(name)
             states.add(state.upper())
-            starts.append(parse_optional_timestamp(item.get("startedAt"), field=f"required check[{index}] startedAt"))
+            starts.append(
+                parse_optional_timestamp(
+                    item.get("startedAt"),
+                    field=f"required check[{index}] startedAt",
+                )
+            )
             completions.append(
                 parse_optional_timestamp(
                     item.get("completedAt"),
@@ -62,22 +91,8 @@ class GitHubChecks:
         after = self.get_pull_request(number)
         if before.head_sha != after.head_sha:
             raise CompareAndSwapConflict("PR HEAD changed while reading required checks")
-        if not states:
-            status = CheckStatus.ABSENT
-        elif states & {
-            "FAILURE",
-            "ERROR",
-            "CANCELLED",
-            "TIMED_OUT",
-            "ACTION_REQUIRED",
-        }:
-            status = CheckStatus.FAILURE
-        elif states <= {"SUCCESS", "SKIPPED", "NEUTRAL"}:
-            status = CheckStatus.SUCCESS
-        else:
-            status = CheckStatus.PENDING
         return CheckSnapshot(
-            status=status,
+            status=_status_from_states(states),
             head_sha=after.head_sha,
             observed_at=datetime.now(tz=UTC),
             names=tuple(sorted(names)),
@@ -92,3 +107,10 @@ class GitHubChecks:
                 else None
             ),
         )
+
+    def required_snapshot(self, number: int) -> CheckSnapshot:
+        before = self.get_pull_request(number)
+        batched = self._batched_required.pop(number, None)
+        if batched is not None and batched.head_sha == before.head_sha:
+            return batched
+        return self._required_snapshot_live(number, before=before)
